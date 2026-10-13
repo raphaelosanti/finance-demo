@@ -1,0 +1,58 @@
+name: Finance Cockpit
+
+on:
+  workflow_dispatch:
+    inputs:
+      modus:
+        description: "live = echter Lauf, demo = Beispieldaten (nur DEMO_-Tabs), check = nur sevDesk-Verbindung prüfen"
+        type: choice
+        options:
+          - live
+          - demo
+          - check
+        default: live
+  schedule:
+    - cron: "0 5 1,15 * *"   # am 1. und 15. um 05:00 UTC = 07:00 Berlin (Sommer) / 06:00 (Winter)
+
+# Verhindert parallele Läufe dieses Workflows; andere Workflows laufen unabhängig
+concurrency:
+  group: finance-cockpit
+  cancel-in-progress: false
+
+jobs:
+  cockpit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Repo auschecken
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Abhängigkeiten installieren
+        run: pip install gspread google-auth
+
+      - name: Finance Cockpit ausführen
+        env:
+          PYTHONUNBUFFERED: "1"
+          GOOGLE_CREDENTIALS_B64: ${{ secrets.GOOGLE_CREDENTIALS_B64 }}
+          FINANCE_SHEET_KEY: ${{ secrets.FINANCE_SHEET_KEY }}
+          SEVDESK_API_TOKEN: ${{ secrets.SEVDESK_API_TOKEN }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_FROM: ${{ secrets.SMTP_FROM }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+          FINANCE_EMAIL: ${{ secrets.FINANCE_EMAIL }}          # optional, überschreibt ALERT_EMAIL
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}  # optional, bevorzugt
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}        # optional, nur mit bezahltem Zugang
+        run: |
+          case "${{ inputs.modus }}" in
+            demo)  python finance_cockpit.py --demo ;;
+            check) python finance_cockpit.py --check ;;
+            *)     python finance_cockpit.py ;;
+          esac
