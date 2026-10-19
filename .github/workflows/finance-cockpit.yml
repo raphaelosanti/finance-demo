@@ -4,23 +4,33 @@ on:
   workflow_dispatch:
     inputs:
       modus:
-        description: "live = echter Lauf, demo = Beispieldaten (nur DEMO_-Tabs), check = nur sevDesk-Verbindung prüfen"
+        description: "Was soll laufen?"
         type: choice
+        default: demo-rechnungen
         options:
-          - live
-          - demo
-          - check
-        default: live
+          - demo-rechnungen
+          - demo-zahlungsliste
+          - check-sevdesk
+          - check-belege
+          - check-lexware
+          - rechnungen
+          - zahlungsliste
+      dry_run:
+        description: "Nur rechnen und im Log zeigen (nichts schreiben, nichts mailen)"
+        type: boolean
+        default: true
   schedule:
-    - cron: "0 5 1,15 * *"   # am 1. und 15. um 05:00 UTC = 07:00 Berlin (Sommer) / 06:00 (Winter)
+    - cron: "0 6 1 * *"     # 1. des Monats: Rechnungs-Cockpit
+    - cron: "0 6 3 * *"     # 3. des Monats: Zahlungsliste
+    - cron: "0 6 15 * *"    # 15. des Monats: Rechnungs-Cockpit
+    # 06:00 UTC = 07:00 (Winterzeit) bzw. 08:00 (Sommerzeit) in Berlin
 
-# Verhindert parallele Läufe dieses Workflows; andere Workflows laufen unabhängig
 concurrency:
   group: finance-cockpit
   cancel-in-progress: false
 
 jobs:
-  cockpit:
+  run:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -33,26 +43,45 @@ jobs:
           python-version: "3.11"
 
       - name: Abhängigkeiten installieren
-        run: pip install gspread google-auth
+        run: pip install -r requirements.txt
 
-      - name: Finance Cockpit ausführen
+      - name: Cockpit ausführen
         env:
           PYTHONUNBUFFERED: "1"
+          EVENT_NAME: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+          MODUS: ${{ inputs.modus }}
+          DRY_RUN: ${{ inputs.dry_run }}
           GOOGLE_CREDENTIALS_B64: ${{ secrets.GOOGLE_CREDENTIALS_B64 }}
           FINANCE_SHEET_KEY: ${{ secrets.FINANCE_SHEET_KEY }}
           SEVDESK_API_TOKEN: ${{ secrets.SEVDESK_API_TOKEN }}
+          LEXWARE_API_KEY: ${{ secrets.LEXWARE_API_KEY }}          # optional
+          SEVDESK_CREDIT_DEBIT: ${{ secrets.SEVDESK_CREDIT_DEBIT }} # optional (C oder D)
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           SMTP_FROM: ${{ secrets.SMTP_FROM }}
           ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
-          FINANCE_EMAIL: ${{ secrets.FINANCE_EMAIL }}          # optional, überschreibt ALERT_EMAIL
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}  # optional, bevorzugt
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}        # optional, nur mit bezahltem Zugang
+          FINANCE_EMAIL: ${{ secrets.FINANCE_EMAIL }}               # optional, überschreibt ALERT_EMAIL
+          BOISON_EMAIL: ${{ secrets.BOISON_EMAIL }}                 # optional: Zahlungsliste an Frau Boison
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_MODEL: ${{ secrets.ANTHROPIC_MODEL }}           # optional
         run: |
-          case "${{ inputs.modus }}" in
-            demo)  python finance_cockpit.py --demo ;;
-            check) python finance_cockpit.py --check ;;
-            *)     python finance_cockpit.py ;;
-          esac
+          ARGS=""
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            if [ "$SCHEDULE" = "0 6 3 * *" ]; then ARGS="--zahlungsliste"; fi
+          else
+            case "$MODUS" in
+              demo-rechnungen)     ARGS="--demo" ;;
+              demo-zahlungsliste)  ARGS="--demo --zahlungsliste" ;;
+              check-sevdesk)       ARGS="--check" ;;
+              check-belege)        ARGS="--check-belege" ;;
+              check-lexware)       ARGS="--check-lexware" ;;
+              zahlungsliste)       ARGS="--zahlungsliste" ;;
+              rechnungen)          ARGS="" ;;
+            esac
+            if [ "$DRY_RUN" = "true" ]; then ARGS="$ARGS --dry-run"; fi
+          fi
+          echo "Starte: python finance_cockpit.py $ARGS"
+          python finance_cockpit.py $ARGS
