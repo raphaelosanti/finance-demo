@@ -1,22 +1,34 @@
 """
-Finance Cockpit (Rechnungs-Cockpit) – läuft als GitHub Action am 1. und 15. jedes Monats
-------------------------------------------------------------------------------------------
-Beantwortet vier Fragen und schickt die Antwort per Mail + Google Sheet:
+Finance Cockpit (Rechnungs-Cockpit + Zahlungsliste) – läuft als GitHub Action
+-----------------------------------------------------------------------------
+Zwei Läufe, beide mit Google Sheet und Mail:
 
-  1. Welche Rechnungen wurden im Monat bezahlt?              (sevDesk: payDate / Status)
-  2. Welche stehen aus?                                      (sevDesk: Status offen)
-  3. Welche sollten gemahnt werden, in welcher Stufe?        (Regeln im Code, nicht in der KI)
-  4. Welche müssen wir noch stellen?                         (Tab "Vertragsstamm" gegen sevDesk)
+A) Rechnungs-Cockpit (am 1. und 15. jedes Monats)
+   1. Welche Rechnungen wurden im Monat bezahlt?              (sevDesk: payDate / Status)
+   2. Welche stehen aus?                                      (sevDesk: Status offen)
+   3. Welche sollten gemahnt werden, in welcher Stufe?        (Regeln im Code, nicht in der KI)
+   4. Welche müssen wir noch stellen?                         (Tab "Vertragsstamm" gegen sevDesk)
+
+B) Zahlungsliste (am 3. jedes Monats)  –  "Das ist zu zahlen"
+   Offene Eingangsrechnungen aus drei Quellen, zusammengeführt zu EINER Liste:
+     - sevDesk-Belege            (SEVDESK_API_TOKEN)
+     - Lexware Office, optional  (LEXWARE_API_KEY; nur mit Lexware Office und API-Zugang)
+     - Tab "Zahlungen_Manuell"   (alles, was woanders liegt: Lohn, Steuern, Miete, Gmail-Rechnungen)
+   Die Liste geht per Mail an Frau Boison (BOISON_EMAIL, falls gesetzt) mit Kopie an die
+   Geschäftsführung. Sie ist ein VORSCHLAG: das Skript löst keine Zahlung aus.
 
 Die Zahlen berechnet der Code. Die KI (Claude oder Gemini) schreibt nur die Zusammenfassung
-über die fertig berechneten Tabellen. Sie versendet nichts: Mahnungen und Zahlungen gibt ein
-Mensch frei.
+des Rechnungs-Cockpits über die fertig berechneten Tabellen. Sie versendet nichts.
 
 Aufruf:
-    python finance_cockpit.py                 normaler Lauf (sevDesk -> Sheet -> Mail)
-    python finance_cockpit.py --demo          Beispieldaten statt sevDesk; schreibt nur in DEMO_-Tabs
-    python finance_cockpit.py --check         prüft nur die sevDesk-Verbindung und zeigt die Felder
-    python finance_cockpit.py --dry-run       rechnet und druckt, schreibt nichts, mailt nichts
+    python finance_cockpit.py                       Rechnungs-Cockpit (sevDesk -> Sheet -> Mail)
+    python finance_cockpit.py --zahlungsliste       Zahlungsliste (Quellen -> Sheet -> Mail)
+    python finance_cockpit.py --demo                Beispieldaten; schreibt nur in DEMO_-Tabs
+    python finance_cockpit.py --demo --zahlungsliste
+    python finance_cockpit.py --check               prüft die sevDesk-Verbindung (Rechnungen)
+    python finance_cockpit.py --check-belege        prüft sevDesk-Belege (Eingangsrechnungen)
+    python finance_cockpit.py --check-lexware       prüft die Lexware-Office-Verbindung
+    python finance_cockpit.py ... --dry-run         rechnet und druckt, schreibt nichts, mailt nichts
 
 Umgebungsvariablen (GitHub Secrets):
     GOOGLE_CREDENTIALS_B64   wie beim Ausschreibungstracker (Pflicht außer bei --dry-run/--check)
@@ -24,6 +36,12 @@ Umgebungsvariablen (GitHub Secrets):
     SEVDESK_API_TOKEN        sevDesk-API-Token (Pflicht außer bei --demo)
     SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, SMTP_FROM   wie beim Tracker (für die Mail)
     ALERT_EMAIL              Empfänger, mehrere mit Komma; FINANCE_EMAIL überschreibt das
+    BOISON_EMAIL             optional: Empfängerin der Zahlungsliste (Frau Boison). Ohne diese
+                             Variable geht die Liste nur an die internen Empfänger.
+    LEXWARE_API_KEY          optional: Lexware-Office-Zahlungen in die Liste aufnehmen
+    SEVDESK_CREDIT_DEBIT     optional: "C" oder "D", um sevDesk-Belege nur einer Seite zu holen
+                             (siehe --check-belege)
+    PAYMENT_HORIZON_DAYS     optional: Zahlungsliste bis heute + N Tage statt bis Monatsende
     ANTHROPIC_API_KEY        für die KI-Zusammenfassung mit Claude (bevorzugt)
     ANTHROPIC_MODEL          optional, Standard claude-sonnet-5-5
     GEMINI_API_KEY           Alternative, wenn kein Anthropic-Key da ist (nur bezahlter Zugang!)
@@ -50,11 +68,14 @@ from zoneinfo import ZoneInfo
 
 TIMEZONE = ZoneInfo("Europe/Berlin")
 SEVDESK_BASE = "https://my.sevdesk.de/api/v1"
+LEXWARE_BASE = "https://api.lexware.io/v1"
 
 TAB_INVOICES = "Rechnungen_Ist"
 TAB_CONTRACTS = "Vertragsstamm"
 TAB_EXPECTED = "Soll_vs_Ist"
 TAB_SUMMARY = "Zusammenfassung"
+TAB_PAYMENTS = "Zahlungsliste"
+TAB_MANUAL = "Zahlungen_Manuell"
 
 # Zahlungsziel, falls eine Rechnung keines hat
 DEFAULT_PAYMENT_DAYS = 14
@@ -70,6 +91,8 @@ DUNNING_STAGES = [
 # sevDesk-Status laut offizieller API-Beschreibung (Stand 2024): 100 Entwurf, 200 offen,
 # 750 teilbezahlt, 1000 bezahlt, 50 deaktivierte Wiederkehr-Vorlage
 STATUS_DRAFT, STATUS_OPEN, STATUS_PARTIAL, STATUS_PAID = 100, 200, 750, 1000
+# Belege (Eingangsrechnungen) in sevDesk: 50 Entwurf, 100 offen, 750 teilbezahlt, 1000 bezahlt
+VOUCHER_OPEN, VOUCHER_PARTIAL = 100, 750
 # Rechnungstypen, die als echte Rechnungen zählen: Rechnung, Schlussrechnung, Teil-, Abschlagsrechnung
 COUNTED_TYPES = {"RE", "ER", "TR", "AR"}
 
@@ -88,6 +111,13 @@ INVOICE_HEADER = [
 ]
 EXPECTED_HEADER = [
     "Monat", "Kunde", "Erwartet netto", "Status", "Rechnungen", "Ausgestellt netto", "Hinweis",
+]
+MANUAL_HEADER = [
+    "Lieferant", "Beschreibung", "Betrag brutto", "Fällig am", "Erledigt", "Hinweis",
+]
+PAYMENT_HEADER = [
+    "Fällig am", "Lieferant", "Beleg / Beschreibung", "Offen brutto", "Tage überfällig",
+    "Abschnitt", "Quelle", "Freigabe (JA/NEIN)", "Hinweis",
 ]
 
 MONTHS_DE = ["Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August",
@@ -169,6 +199,10 @@ def month_start(d):
 def add_months(d, n):
     index = d.year * 12 + (d.month - 1) + n
     return date(index // 12, index % 12 + 1, 1)
+
+
+def month_end(d):
+    return add_months(month_start(d), 1) - timedelta(days=1)
 
 
 def month_label(d):
@@ -386,7 +420,6 @@ def parse_contracts(rows):
     if not rows:
         return [], ["Vertragsstamm ist leer."]
     header = [h.strip().lower() for h in rows[0]]
-    wanted = {name.lower(): i for i, name in enumerate(CONTRACT_HEADER)}
     index = {}
     for name in CONTRACT_HEADER:
         if name.lower() in header:
@@ -448,7 +481,7 @@ def expected_vs_issued(contracts, invoices, today):
     months = [add_months(month_start(today), -1), month_start(today)]
     customers = []
     for c in contracts:
-        if not any(same_customer(c["customer"], k) and c["customer"] == k for k in customers):
+        if c["customer"] not in customers:
             customers.append(c["customer"])
 
     for month in months:
@@ -489,7 +522,7 @@ def expected_vs_issued(contracts, invoices, today):
 
 
 # --------------------------------------------------------------------------
-# Auswertung
+# Auswertung Rechnungs-Cockpit
 # --------------------------------------------------------------------------
 
 def build_report(invoices, contracts, contract_notes, today):
@@ -666,6 +699,10 @@ def smtp_settings():
             "sender": os.environ.get("SMTP_FROM") or user}
 
 
+def internal_recipients():
+    return os.environ.get("FINANCE_EMAIL") or os.environ.get("ALERT_EMAIL") or "info@blindleister.de"
+
+
 def build_subject(report, demo=False):
     n_over, amount = len(report["overdue"]), report["totals"]["overdue"]
     n_missing = len(report["missing"])
@@ -675,14 +712,16 @@ def build_subject(report, demo=False):
     return f"{'[DEMO] ' if demo else ''}Rechnungs-Cockpit {report['today']:%d.%m.%Y}: " + ", ".join(parts)
 
 
-def send_mail(subject, body):
+def send_mail(subject, body, to=None, cc=None):
     settings = smtp_settings()
     if not settings:
         print("SMTP nicht konfiguriert: es wird keine Mail verschickt.")
         return False
-    recipients = os.environ.get("FINANCE_EMAIL") or os.environ.get("ALERT_EMAIL") or "info@blindleister.de"
+    recipients = to or internal_recipients()
     msg = EmailMessage()
     msg["Subject"], msg["From"], msg["To"] = subject, settings["sender"], recipients
+    if cc:
+        msg["Cc"] = cc
     msg.set_content(body)
     if settings["port"] == 465:
         with smtplib.SMTP_SSL(settings["host"], settings["port"], timeout=30) as smtp:
@@ -693,7 +732,7 @@ def send_mail(subject, body):
             smtp.starttls()
             smtp.login(settings["user"], settings["password"])
             smtp.send_message(msg)
-    print(f"Mail an {recipients} verschickt: {subject}")
+    print(f"Mail an {recipients}{' (Kopie: ' + cc + ')' if cc else ''} verschickt: {subject}")
     return True
 
 
@@ -802,6 +841,428 @@ def read_contracts_from_sheet(sheet_key):
 
 
 # --------------------------------------------------------------------------
+# Zahlungsliste: Quellen
+# --------------------------------------------------------------------------
+
+def payable(source, supplier, ref, due, open_amount, gross=None, note=""):
+    return {"source": source, "supplier": supplier or "(unbekannt)", "ref": ref or "", "due": due,
+            "open": round(float(open_amount), 2), "gross": gross, "note": note}
+
+
+def parse_voucher(raw):
+    """sevDesk-Beleg (Eingangsrechnung) -> Zahlungsposition."""
+    supplier = str(raw.get("supplierName") or "").strip() or contact_name(raw.get("supplier"))
+    gross = parse_amount(raw.get("sumGross"))
+    paid = parse_amount(raw.get("paidAmount"))
+    return payable("sevDesk", supplier, str(raw.get("description") or "").strip(),
+                   parse_date(raw.get("paymentDeadline")), max(gross - paid, 0.0), gross)
+
+
+def fetch_sevdesk_payables(token):
+    """Offene und teilbezahlte Belege. Optional nur eine Seite (C/D) über SEVDESK_CREDIT_DEBIT."""
+    side = (os.environ.get("SEVDESK_CREDIT_DEBIT") or "").strip().upper()
+    items = []
+    for status in (VOUCHER_OPEN, VOUCHER_PARTIAL):
+        offset = 0
+        while True:
+            params = {"status": status, "limit": 1000, "offset": offset}
+            if side in ("C", "D"):
+                params["creditDebit"] = side
+            try:
+                data = sevdesk_get(token, "/Voucher", params)
+            except RuntimeError:
+                if status == VOUCHER_PARTIAL:
+                    break          # Status 750 wird für Belege nicht in jedem Konto angeboten
+                raise
+            objects = data.get("objects") or []
+            items += [parse_voucher(o) for o in objects]
+            if len(objects) < 1000:
+                break
+            offset += 1000
+    return items
+
+
+def check_vouchers(token):
+    """Zeigt echte Belege und die Verteilung C/D, damit man die richtige Seite wählen kann."""
+    data = sevdesk_get(token, "/Voucher", {"status": VOUCHER_OPEN, "limit": 100})
+    objects = data.get("objects") or []
+    print(f"sevDesk-Belege (Status offen): {len(objects)} geladen.")
+    counts = {}
+    for o in objects:
+        side = str(o.get("creditDebit") or "?")
+        counts[side] = counts.get(side, 0) + 1
+    print("creditDebit-Verteilung:", counts or "keine")
+    if objects:
+        print("Felder:", ", ".join(sorted(objects[0].keys())))
+    for o in objects[:8]:
+        p = parse_voucher(o)
+        print(f"  [{o.get('creditDebit')}] {p['supplier']} | {p['ref'] or '-'} | fällig {p['due']} | "
+              f"offen {p['open']}")
+    print("Wenn hier auch Einnahmen auftauchen: SEVDESK_CREDIT_DEBIT auf die Seite der Ausgaben setzen "
+          "(C oder D).")
+    return objects
+
+
+def lexware_get(key, path, params):
+    url = f"{LEXWARE_BASE}{path}?" + urllib.parse.urlencode(params)
+    last = None
+    for attempt in range(4):
+        request = urllib.request.Request(url, headers={
+            "Authorization": f"Bearer {key}", "Accept": "application/json",
+            "User-Agent": "blindleister-finance-cockpit"})
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", "replace")[:200]
+            if exc.code in (429, 500, 502, 503) and attempt < 3:
+                time.sleep(3 * (attempt + 1))        # Lexware erlaubt 2 Anfragen pro Sekunde
+                last = exc
+                continue
+            if exc.code in (401, 403):
+                raise RuntimeError(f"Lexware HTTP {exc.code}: API-Key ungültig oder Tarif ohne API. {body}") from exc
+            raise RuntimeError(f"Lexware HTTP {exc.code}: {body}") from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            last = exc
+            time.sleep(3)
+    raise RuntimeError(f"Lexware nicht erreichbar: {short_error(last)}")
+
+
+def fetch_lexware_payables(key, max_pages=40):
+    """Offene und überfällige Eingangsrechnungen (purchaseinvoice) aus Lexware Office."""
+    items = []
+    for status in ("open", "overdue"):
+        page = 0
+        while page < max_pages:
+            data = lexware_get(key, "/voucherlist", {
+                "voucherType": "purchaseinvoice", "voucherStatus": status, "page": page, "size": 100})
+            content = data.get("content") or []
+            for c in content:
+                items.append(payable(
+                    "Lexware", str(c.get("contactName") or "").strip(), str(c.get("voucherNumber") or "").strip(),
+                    parse_date(c.get("dueDate")), parse_amount(c.get("openAmount")),
+                    parse_amount(c.get("totalAmount"))))
+            if not content or data.get("last", True):
+                break
+            page += 1
+            time.sleep(0.6)
+        time.sleep(0.6)
+    return items
+
+
+def check_lexware(key):
+    data = lexware_get(key, "/voucherlist", {
+        "voucherType": "purchaseinvoice", "voucherStatus": "open", "page": 0, "size": 5})
+    content = data.get("content") or []
+    print(f"Lexware erreichbar, {len(content)} offene Eingangsrechnung(en) auf Seite 1 "
+          f"(gesamt: {data.get('totalElements', '?')}).")
+    if content:
+        print("Felder:", ", ".join(sorted(content[0].keys())))
+    for c in content:
+        print(f"  {c.get('contactName')} | {c.get('voucherNumber')} | fällig {c.get('dueDate')} | "
+              f"offen {c.get('openAmount')}")
+    return content
+
+
+def ensure_manual_tab(spreadsheet):
+    ws, created = get_or_create_tab(spreadsheet, TAB_MANUAL, MANUAL_HEADER, rows=200)
+    if created:
+        ws.update(range_name="A2", values=[[
+            "BEISPIEL Lieferant (Zeile löschen)", "Rechnung 123", 119, "2026-11-15", "JA",
+            "Hier alles eintragen, was nicht in sevDesk oder Lexware liegt (Lohn, Steuern, Miete, "
+            "Rechnungen aus Gmail). Erledigt = JA nimmt eine Zeile aus der Liste."]],
+            value_input_option="RAW")
+    return ws, created
+
+
+def parse_manual_payables(rows):
+    """Tab 'Zahlungen_Manuell' -> Zahlungspositionen. Zeilen mit Erledigt = JA werden übersprungen."""
+    if not rows:
+        return [], []
+    header = [h.strip().lower() for h in rows[0]]
+    index = {name: header.index(name.lower()) for name in MANUAL_HEADER if name.lower() in header}
+    missing = [n for n in ("Lieferant", "Betrag brutto") if n not in index]
+    if missing:
+        return [], [f"Zahlungen_Manuell: Spalte(n) fehlen: {', '.join(missing)}."]
+
+    def cell(row, name):
+        i = index.get(name)
+        return row[i].strip() if i is not None and i < len(row) else ""
+
+    items, notes = [], []
+    for row in rows[1:]:
+        supplier = cell(row, "Lieferant")
+        if not supplier or cell(row, "Erledigt").upper() == "JA":
+            continue
+        amount = parse_amount(cell(row, "Betrag brutto"))
+        if amount <= 0:
+            notes.append(f"Zahlungen_Manuell: '{supplier}' ohne Betrag, übersprungen.")
+            continue
+        items.append(payable("Manuell", supplier, cell(row, "Beschreibung"),
+                             parse_date(cell(row, "Fällig am")), amount, amount, cell(row, "Hinweis")))
+    return items, notes
+
+
+def read_manual_payables(spreadsheet, create=True):
+    import gspread
+    if create:
+        ws, created = ensure_manual_tab(spreadsheet)
+        if created:
+            return [], [f"Der Tab '{TAB_MANUAL}' wurde neu angelegt: dort Zahlungen eintragen, die nicht "
+                        "in sevDesk/Lexware stehen."]
+    else:
+        try:
+            ws = spreadsheet.worksheet(TAB_MANUAL)
+        except gspread.WorksheetNotFound:
+            return [], [f"Tab '{TAB_MANUAL}' existiert noch nicht (wird beim echten Lauf angelegt)."]
+    return parse_manual_payables(ws.get_all_values())
+
+
+# --------------------------------------------------------------------------
+# Zahlungsliste: Auswertung, Text, Sheet
+# --------------------------------------------------------------------------
+
+SECTION_RANK = {"ÜBERFÄLLIG": 0, "FÄLLIG": 1, "FÄLLIGKEIT FEHLT": 2}
+
+
+def payment_horizon(today):
+    days = os.environ.get("PAYMENT_HORIZON_DAYS")
+    if days and days.strip().isdigit():
+        return today + timedelta(days=int(days))
+    return month_end(today)
+
+
+def build_payment_list(items, today, horizon_end):
+    rows, later = [], []
+    for it in items:
+        if it["open"] <= 0.005:
+            continue
+        due = it["due"]
+        row = dict(it)
+        if due is None:
+            row.update(section="FÄLLIGKEIT FEHLT", days_overdue=0)
+        elif due < today:
+            row.update(section="ÜBERFÄLLIG", days_overdue=(today - due).days)
+        elif due <= horizon_end:
+            row.update(section="FÄLLIG", days_overdue=0)
+        else:
+            later.append(row)
+            continue
+        rows.append(row)
+    rows.sort(key=lambda r: (SECTION_RANK[r["section"]], -r["days_overdue"], r["due"] or date.max, r["supplier"]))
+    total = round(sum(r["open"] for r in rows), 2)
+    over = [r for r in rows if r["section"] == "ÜBERFÄLLIG"]
+    return {
+        "today": today, "horizon_end": horizon_end, "rows": rows,
+        "total": total, "overdue_count": len(over), "overdue_total": round(sum(r["open"] for r in over), 2),
+        "later_count": len(later), "later_total": round(sum(r["open"] for r in later), 2),
+    }
+
+
+def payment_subject(plist, incomplete=False, demo=False):
+    prefix = ("[DEMO] " if demo else "") + ("[UNVOLLSTÄNDIG] " if incomplete else "")
+    t = plist["today"]
+    return (f"{prefix}Zahlungsliste {MONTHS_DE[t.month - 1]} {t.year}: {len(plist['rows'])} Position(en), "
+            f"{eur(plist['total'])}" + (f" ({plist['overdue_count']} überfällig)" if plist["overdue_count"] else ""))
+
+
+def payment_text(plist, notes, errors):
+    today, horizon = plist["today"], plist["horizon_end"]
+    lines = [f"Zahlungsliste – Stand {today:%d.%m.%Y}, fällig bis {horizon:%d.%m.%Y}", ""]
+    if errors:
+        lines += ["ACHTUNG: LISTE UNVOLLSTÄNDIG"] + [f"- {e}" for e in errors] + [""]
+    lines += ["ZUSAMMENFASSUNG",
+              f"- {len(plist['rows'])} Position(en), zusammen {eur(plist['total'])} brutto",
+              f"- davon überfällig: {plist['overdue_count']}, {eur(plist['overdue_total'])}"]
+    if plist["later_count"]:
+        lines.append(f"- später fällig (nicht in dieser Liste): {plist['later_count']}, "
+                     f"{eur(plist['later_total'])}")
+    lines.append("")
+
+    titles = {"ÜBERFÄLLIG": "ÜBERFÄLLIG", "FÄLLIG": f"FÄLLIG BIS {horizon:%d.%m.%Y}",
+              "FÄLLIGKEIT FEHLT": "OHNE FÄLLIGKEITSDATUM (bitte prüfen)"}
+    for section in ("ÜBERFÄLLIG", "FÄLLIG", "FÄLLIGKEIT FEHLT"):
+        group = [r for r in plist["rows"] if r["section"] == section]
+        if not group:
+            continue
+        lines.append(f"{titles[section]} ({len(group)}, {eur(sum(r['open'] for r in group))})")
+        for r in group:
+            due = f"{r['due']:%d.%m.%Y}" if r["due"] else "ohne Datum"
+            extra = f" | {days_text(r['days_overdue'])} überfällig" if r["days_overdue"] else ""
+            ref = f" | {r['ref']}" if r["ref"] else ""
+            note = f" | Hinweis: {r['note']}" if r["note"] else ""
+            lines.append(f"- {due} | {r['supplier']}{ref} | {eur(r['open'])}{extra} | Quelle: {r['source']}{note}")
+        lines.append("")
+    if not plist["rows"]:
+        if errors:
+            lines += ["Die Liste ist leer, weil mindestens eine Quelle nicht abrufbar war (siehe oben). "
+                      "Das heißt NICHT, dass nichts zu zahlen ist.", ""]
+        else:
+            lines += ["Keine offenen Zahlungen bis zum Stichtag gefunden.", ""]
+
+    if notes:
+        lines += ["HINWEISE"] + [f"- {n}" for n in notes] + [""]
+    lines += ["Diese Liste ist ein Vorschlag aus den Daten von sevDesk/Lexware und dem Tab "
+              f"'{TAB_MANUAL}'. Es wurde keine Zahlung ausgelöst; die Geschäftsführung gibt Zahlungen "
+              "frei."]
+    return "\n".join(lines)
+
+
+def payment_rows(plist):
+    return [[
+        r["due"].isoformat() if r["due"] else "", safe_cell(r["supplier"]), safe_cell(r["ref"]),
+        r["open"], r["days_overdue"] or "", r["section"], r["source"], "", safe_cell(r["note"]),
+    ] for r in plist["rows"]]
+
+
+def write_payment_sheet(spreadsheet, plist, demo=False):
+    prefix = "DEMO_" if demo else ""
+    ws, _ = get_or_create_tab(spreadsheet, prefix + TAB_PAYMENTS, PAYMENT_HEADER)
+    write_table(ws, PAYMENT_HEADER, payment_rows(plist))
+
+
+def payment_recipients(demo=False):
+    """(An, Kopie). Frau Boison bekommt die Liste nur, wenn BOISON_EMAIL gesetzt ist (nie im Demo)."""
+    internal = internal_recipients()
+    boison = (os.environ.get("BOISON_EMAIL") or "").strip()
+    if demo or not boison:
+        return internal, None
+    return boison, internal
+
+
+def demo_payables(today):
+    d = lambda n: today + timedelta(days=n)
+    return [
+        payable("sevDesk", "Hetzner Online GmbH", "R-2026-1101", d(-12), 53.21, 53.21),
+        payable("sevDesk", "Google Cloud EMEA Limited", "G-884-2210", d(-3), 214.66, 214.66),
+        payable("sevDesk", "Steuerberatung Boison", "Honorar Oktober", d(8), 892.50, 892.50),
+        payable("sevDesk", "Qonto (Olinda SAS)", "Abo Oktober", d(14), 29.00, 29.00),
+        payable("sevDesk", "Rechtsanwälte Muster PartG", "RA-2026-77", d(45), 1190.00, 1190.00),   # später
+        payable("Manuell", "Netto-Löhne Oktober", "Lohnlauf", d(10), 12480.00, 12480.00,
+                "aus Lexware Lohn & Gehalt, Betrag laut Lohnjournal"),
+        payable("Manuell", "Finanzamt: Umsatzsteuer-Voranmeldung", "USt Oktober", d(21), 3150.40, 3150.40),
+        payable("Manuell", "Büromiete", "Miete November", None, 861.06, 861.06),
+    ]
+
+
+# --------------------------------------------------------------------------
+# Hauptläufe
+# --------------------------------------------------------------------------
+
+def run(demo=False, dry_run=False):
+    today = today_berlin()
+    sheet_key = os.environ.get("FINANCE_SHEET_KEY")
+
+    if demo:
+        invoices, contracts = demo_data(today)
+        contract_notes = ["DEMO: Beispieldaten, keine echten Rechnungen."]
+    else:
+        token = os.environ.get("SEVDESK_API_TOKEN")
+        if not token:
+            raise RuntimeError("SEVDESK_API_TOKEN ist nicht gesetzt (oder --demo benutzen).")
+        invoices = load_invoices(token)
+        print(f"sevDesk: {len(invoices)} Rechnungen geladen.")
+        if dry_run or not sheet_key:
+            contracts, contract_notes = [], ["Kein Sheet konfiguriert: Vertragsstamm nicht gelesen."]
+        else:
+            contracts, contract_notes = read_contracts_from_sheet(sheet_key)
+
+    report = build_report(invoices, contracts, contract_notes, today)
+    base_text = report_text(report)
+    ai_text, ai_note = ai_summary(report)
+    if ai_note:
+        print(ai_note)
+
+    subject = build_subject(report, demo)
+    body = ((ai_text + "\n\n" + "=" * 40 + "\nDETAILS (berechnet)\n" + "=" * 40 + "\n") if ai_text else "") + base_text
+    if ai_note:
+        body += f"\n\n({ai_note})"
+
+    print(body)
+    if dry_run:
+        print("\n--dry-run: nichts geschrieben, nichts verschickt.")
+        return report
+
+    if sheet_key:
+        write_sheet(report, subject, ai_text or base_text, sheet_key, demo=demo)
+        print("Google Sheet aktualisiert" + (" (Tabs mit Präfix DEMO_)." if demo else "."))
+    else:
+        print("FINANCE_SHEET_KEY nicht gesetzt: Sheet wird nicht aktualisiert.")
+
+    send_mail(subject, body)
+    return report
+
+
+def run_payments(demo=False, dry_run=False):
+    """Zahlungsliste: Quellen sammeln, zusammenführen, ins Sheet schreiben und mailen."""
+    today = today_berlin()
+    sheet_key = os.environ.get("FINANCE_SHEET_KEY")
+    notes, errors, items = [], [], []
+    spreadsheet = None
+
+    if demo:
+        items = demo_payables(today)
+        notes.append("DEMO: Beispieldaten, keine echten Zahlungen.")
+    else:
+        sources = 0
+        token = os.environ.get("SEVDESK_API_TOKEN")
+        if token:
+            sources += 1
+            try:
+                found = fetch_sevdesk_payables(token)
+                items += found
+                print(f"sevDesk: {len(found)} offene Beleg(e).")
+            except Exception as exc:
+                errors.append(f"sevDesk-Belege nicht abrufbar: {short_error(exc)}")
+        lexware_key = os.environ.get("LEXWARE_API_KEY")
+        if lexware_key:
+            sources += 1
+            try:
+                found = fetch_lexware_payables(lexware_key)
+                items += found
+                print(f"Lexware: {len(found)} offene Eingangsrechnung(en).")
+            except Exception as exc:
+                errors.append(f"Lexware nicht abrufbar: {short_error(exc)}")
+        if sheet_key and (not dry_run or os.environ.get("GOOGLE_CREDENTIALS_B64")):
+            sources += 1
+            try:
+                spreadsheet = open_sheet(sheet_key)
+                found, manual_notes = read_manual_payables(spreadsheet, create=not dry_run)
+                items += found
+                notes += manual_notes
+                print(f"Tab {TAB_MANUAL}: {len(found)} Position(en).")
+            except Exception as exc:
+                errors.append(f"Tab {TAB_MANUAL} nicht lesbar: {short_error(exc)}")
+        if sources == 0:
+            raise RuntimeError("Keine Quelle konfiguriert: SEVDESK_API_TOKEN, LEXWARE_API_KEY oder "
+                               "FINANCE_SHEET_KEY (+ GOOGLE_CREDENTIALS_B64) setzen, oder --demo benutzen.")
+
+    plist = build_payment_list(items, today, payment_horizon(today))
+    subject = payment_subject(plist, incomplete=bool(errors), demo=demo)
+    body = payment_text(plist, notes, errors)
+    to, cc = payment_recipients(demo)
+    print(body)
+    print(f"\nEmpfänger: {to}" + (f" (Kopie: {cc})" if cc else ""))
+
+    if dry_run:
+        print("\n--dry-run: nichts geschrieben, nichts verschickt.")
+        return plist
+
+    if sheet_key:
+        spreadsheet = spreadsheet or open_sheet(sheet_key)
+        write_payment_sheet(spreadsheet, plist, demo=demo)
+        print("Google Sheet aktualisiert" + (" (Tab DEMO_Zahlungsliste)." if demo else f" (Tab {TAB_PAYMENTS})."))
+    else:
+        print("FINANCE_SHEET_KEY nicht gesetzt: Sheet wird nicht aktualisiert.")
+
+    send_mail(subject, body, to=to, cc=cc)
+    if errors:
+        # Absichtlich: Der Lauf wird rot, damit eine unvollständige Liste nicht unbemerkt bleibt.
+        raise RuntimeError("Zahlungsliste unvollständig: " + " | ".join(errors))
+    return plist
+
+
+# --------------------------------------------------------------------------
 # Demo-Daten (für die Vorführung ohne sevDesk-Zugang)
 # --------------------------------------------------------------------------
 
@@ -850,57 +1311,15 @@ def demo_data(today):
     return invoices, contracts
 
 
-# --------------------------------------------------------------------------
-# Hauptlauf
-# --------------------------------------------------------------------------
-
-def run(demo=False, dry_run=False):
-    today = today_berlin()
-    sheet_key = os.environ.get("FINANCE_SHEET_KEY")
-
-    if demo:
-        invoices, contracts = demo_data(today)
-        contract_notes = ["DEMO: Beispieldaten, keine echten Rechnungen."]
-    else:
-        token = os.environ.get("SEVDESK_API_TOKEN")
-        if not token:
-            raise RuntimeError("SEVDESK_API_TOKEN ist nicht gesetzt (oder --demo benutzen).")
-        invoices = load_invoices(token)
-        print(f"sevDesk: {len(invoices)} Rechnungen geladen.")
-        if dry_run or not sheet_key:
-            contracts, contract_notes = [], ["Kein Sheet konfiguriert: Vertragsstamm nicht gelesen."]
-        else:
-            contracts, contract_notes = read_contracts_from_sheet(sheet_key)
-
-    report = build_report(invoices, contracts, contract_notes, today)
-    base_text = report_text(report)
-    ai_text, ai_note = ai_summary(report)
-    if ai_note:
-        print(ai_note)
-
-    subject = build_subject(report, demo)
-    body = ((ai_text + "\n\n" + "=" * 40 + "\nDETAILS (berechnet)\n" + "=" * 40 + "\n") if ai_text else "") + base_text
-    if ai_note:
-        body += f"\n\n({ai_note})"
-
-    print(body)
-    if dry_run:
-        print("\n--dry-run: nichts geschrieben, nichts verschickt.")
-        return report
-
-    if sheet_key:
-        write_sheet(report, subject, ai_text or base_text, sheet_key, demo=demo)
-        print("Google Sheet aktualisiert" + (" (Tabs mit Präfix DEMO_)." if demo else "."))
-    else:
-        print("FINANCE_SHEET_KEY nicht gesetzt: Sheet wird nicht aktualisiert.")
-
-    send_mail(subject, body)
-    return report
-
-
 if __name__ == "__main__":
     args = set(sys.argv[1:])
     if "--check" in args:
         check_sevdesk(os.environ.get("SEVDESK_API_TOKEN") or sys.exit("SEVDESK_API_TOKEN fehlt."))
+    elif "--check-belege" in args:
+        check_vouchers(os.environ.get("SEVDESK_API_TOKEN") or sys.exit("SEVDESK_API_TOKEN fehlt."))
+    elif "--check-lexware" in args:
+        check_lexware(os.environ.get("LEXWARE_API_KEY") or sys.exit("LEXWARE_API_KEY fehlt."))
+    elif "--zahlungsliste" in args:
+        run_payments(demo="--demo" in args, dry_run="--dry-run" in args)
     else:
         run(demo="--demo" in args, dry_run="--dry-run" in args)
